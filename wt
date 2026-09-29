@@ -1,0 +1,485 @@
+#!/bin/bash
+#
+# wt - git worktree manager
+#
+# Creates, lists and deletes git worktrees using a config file that maps each
+# repository to its base branch and defines where worktrees are stored.
+#
+# Compatible with bash 3.2 (the version shipped with macOS).
+
+set -eo pipefail
+
+CONFIG_FILE="${WT_CONFIG:-$HOME/.config/wt/config}"
+
+if [ -t 1 ]; then
+    C_RED=$'\033[0;31m'
+    C_GREEN=$'\033[0;32m'
+    C_YELLOW=$'\033[0;33m'
+    C_BLUE=$'\033[0;34m'
+    C_DIM=$'\033[2m'
+    C_OFF=$'\033[0m'
+else
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_DIM=""; C_OFF=""
+fi
+
+die()     { printf '%s\n' "${C_RED}error:${C_OFF} $*" >&2; exit 1; }
+warn()    { printf '%s\n' "${C_YELLOW}warning:${C_OFF} $*" >&2; }
+info()    { printf '%s\n' "${C_BLUE}==>${C_OFF} $*"; }
+success() { printf '%s\n' "${C_GREEN}ok:${C_OFF} $*"; }
+
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+expand_tilde() {
+    case "$1" in
+        "~")   printf '%s' "$HOME" ;;
+        "~/"*) printf '%s' "$HOME/${1#\~/}" ;;
+        *)     printf '%s' "$1" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+#
+# Format (INI-ish). Keys outside a section are treated as repo mappings so the
+# simple form below works on its own:
+#
+#   worktree_root = ~/Work/worktrees
+#
+#   [repos]
+#   <repo1> = <branch1>
+#   <repo2> = <branch2>
+#
+#   [roots]                      # optional per-repo override of worktree_root
+#   <repo2> = ~/Work/<repo2>-trees
+
+write_default_config() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" <<'EOF'
+# wt configuration
+#
+# worktree_root: where worktrees are created. Each worktree ends up at
+#   <worktree_root>/<repo>/<name>
+worktree_root = ~/Work/worktrees
+
+# Map each repository directory name to the branch new worktrees branch off.
+[repos]
+# <repo1> = <branch1>
+# <repo2> = <branch2>
+
+# Optional: override worktree_root for specific repositories.
+[roots]
+EOF
+}
+
+# config_get <section> <key>
+# Prints the value, or returns 1 when the key is absent. Keys defined before
+# any section header are matched when <section> is "repos" or "".
+config_get() {
+    local want_section="$1" want_key="$2"
+    local line section="" key value found=1
+
+    [ -f "$CONFIG_FILE" ] || return 1
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="$(trim "$line")"
+        [ -z "$line" ] && continue
+
+        if [ "${line#\[}" != "$line" ] && [ "${line%\]}" != "$line" ]; then
+            section="$(trim "${line#\[}")"
+            section="$(trim "${section%\]}")"
+            continue
+        fi
+
+        case "$line" in
+            *=*) ;;
+            *) continue ;;
+        esac
+
+        key="$(trim "${line%%=*}")"
+        value="$(trim "${line#*=}")"
+
+        local effective="$section"
+        [ -z "$effective" ] && effective="repos"
+
+        if [ "$effective" = "$want_section" ] && [ "$key" = "$want_key" ]; then
+            printf '%s' "$value"
+            found=0
+            break
+        fi
+    done < "$CONFIG_FILE"
+
+    return $found
+}
+
+config_worktree_root() {
+    local repo="$1" root=""
+
+    root="$(config_get roots "$repo" || true)"
+    [ -z "$root" ] && root="$(config_get settings worktree_root || true)"
+    [ -z "$root" ] && root="$(config_get repos worktree_root || true)"
+
+    [ -n "$root" ] || die "no 'worktree_root' set in $CONFIG_FILE"
+    expand_tilde "$root"
+}
+
+config_base_branch() {
+    local repo="$1" branch
+    branch="$(config_get repos "$repo" || true)"
+    [ -n "$branch" ] || return 1
+    printf '%s' "$branch"
+}
+
+# ---------------------------------------------------------------------------
+# Repository discovery
+# ---------------------------------------------------------------------------
+
+# Resolves the *main* repository root even when invoked from inside a worktree,
+# so `wt` behaves identically in both places.
+resolve_repo() {
+    git rev-parse --git-common-dir >/dev/null 2>&1 \
+        || die "not inside a git repository"
+
+    local common_dir
+    common_dir="$(git rev-parse --git-common-dir)"
+    case "$common_dir" in
+        /*) ;;
+        *) common_dir="$PWD/$common_dir" ;;
+    esac
+
+    REPO_ROOT="$(cd "$common_dir/.." && pwd -P)"
+    REPO_NAME="$(basename "$REPO_ROOT")"
+}
+
+# ---------------------------------------------------------------------------
+# Worktree enumeration
+# ---------------------------------------------------------------------------
+#
+# Fills WT_PATHS / WT_BRANCHES with every worktree except the main checkout,
+# in the order reported by git, which is the order `wt list` numbers them.
+
+load_worktrees() {
+    WT_PATHS=()
+    WT_BRANCHES=()
+
+    local line path="" branch=""
+
+    add_entry() {
+        [ -z "$path" ] && return 0
+        [ "$path" = "$REPO_ROOT" ] && { path=""; branch=""; return 0; }
+        WT_PATHS[${#WT_PATHS[@]}]="$path"
+        WT_BRANCHES[${#WT_BRANCHES[@]}]="${branch:-(detached)}"
+        path=""
+        branch=""
+    }
+
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*) add_entry; path="${line#worktree }" ;;
+            "branch refs/heads/"*) branch="${line#branch refs/heads/}" ;;
+            "detached") branch="(detached)" ;;
+            "bare") path="" ;;
+        esac
+    done < <(git -C "$REPO_ROOT" worktree list --porcelain)
+
+    add_entry
+}
+
+worktree_count() {
+    printf '%s' "${#WT_PATHS[@]}"
+}
+
+# Maps a user-supplied name or 1-based index onto a worktree, setting
+# SELECTED_PATH / SELECTED_BRANCH.
+select_worktree() {
+    local target="$1" i=0 total="${#WT_PATHS[@]}"
+
+    case "$target" in
+        ''|*[!0-9]*)
+            while [ "$i" -lt "$total" ]; do
+                if [ "$(basename "${WT_PATHS[$i]}")" = "$target" ] \
+                   || [ "${WT_BRANCHES[$i]}" = "$target" ] \
+                   || [ "${WT_PATHS[$i]}" = "$target" ]; then
+                    SELECTED_PATH="${WT_PATHS[$i]}"
+                    SELECTED_BRANCH="${WT_BRANCHES[$i]}"
+                    return 0
+                fi
+                i=$((i + 1))
+            done
+            return 1
+            ;;
+        *)
+            local idx=$((target - 1))
+            [ "$idx" -ge 0 ] && [ "$idx" -lt "$total" ] || return 1
+            SELECTED_PATH="${WT_PATHS[$idx]}"
+            SELECTED_BRANCH="${WT_BRANCHES[$idx]}"
+            return 0
+            ;;
+    esac
+}
+
+is_inside() {
+    local dir="$1" cur
+    cur="$(pwd -P)"
+    case "$cur" in
+        "$dir"|"$dir"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_create() {
+    local name="" base=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from|-b)
+                [ $# -ge 2 ] || die "$1 requires a branch name"
+                base="$2"; shift 2 ;;
+            -*) die "unknown option for create: $1" ;;
+            *) [ -z "$name" ] && name="$1" || die "unexpected argument: $1"; shift ;;
+        esac
+    done
+
+    [ -n "$name" ] || die "usage: wt create <name> [--from <branch>]"
+
+    resolve_repo
+
+    if [ -z "$base" ]; then
+        base="$(config_base_branch "$REPO_NAME" || true)"
+        [ -n "$base" ] || die "no base branch configured for '$REPO_NAME'
+  add this line to $CONFIG_FILE under [repos]:
+    $REPO_NAME = <branch>"
+    fi
+
+    local root path
+    root="$(config_worktree_root "$REPO_NAME")"
+    path="$root/$REPO_NAME/$name"
+
+    [ -e "$path" ] && die "path already exists: $path"
+
+    if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$name"; then
+        die "branch '$name' already exists"
+    fi
+
+    info "fetching origin/$base"
+    local start_point="$base"
+    if git -C "$REPO_ROOT" fetch --quiet origin "$base" 2>/dev/null; then
+        start_point="FETCH_HEAD"
+    elif git -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/$base"; then
+        warn "fetch failed, using the local copy of origin/$base"
+        start_point="origin/$base"
+    elif git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$base"; then
+        warn "no origin/$base, branching from local '$base'"
+        start_point="$base"
+    else
+        die "base branch '$base' not found locally or on origin"
+    fi
+
+    mkdir -p "$(dirname "$path")"
+
+    info "creating worktree '$name' from '$base'"
+    git -C "$REPO_ROOT" worktree add -b "$name" "$path" "$start_point"
+
+    success "$path"
+    printf '%s\n' "${C_DIM}cd $path${C_OFF}"
+}
+
+cmd_list() {
+    resolve_repo
+    load_worktrees
+
+    local total i=0
+    total="$(worktree_count)"
+
+    if [ "$total" -eq 0 ]; then
+        info "no worktrees for '$REPO_NAME'"
+        return 0
+    fi
+
+    info "worktrees for '$REPO_NAME'"
+    while [ "$i" -lt "$total" ]; do
+        local path="${WT_PATHS[$i]}" marker=""
+        if [ -d "$path" ] && [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]; then
+            marker=" ${C_YELLOW}*${C_OFF}"
+        fi
+        [ -d "$path" ] || marker=" ${C_RED}(missing)${C_OFF}"
+
+        printf '  %s%2d%s  %-28s %s%s%s%s\n' \
+            "$C_GREEN" "$((i + 1))" "$C_OFF" \
+            "$(basename "$path")" \
+            "$C_DIM" "${WT_BRANCHES[$i]}" "$C_OFF" "$marker"
+        i=$((i + 1))
+    done
+}
+
+delete_one() {
+    local path="$1" branch="$2" force="$3"
+
+    if is_inside "$path"; then
+        die "you are currently inside $path — cd out of it first"
+    fi
+
+    local rm_args=()
+    [ "$force" = "1" ] && rm_args=(--force)
+
+    if ! git -C "$REPO_ROOT" worktree remove ${rm_args[@]+"${rm_args[@]}"} "$path" 2>/dev/null; then
+        if [ "$force" = "1" ]; then
+            rm -rf "$path"
+            git -C "$REPO_ROOT" worktree prune
+        else
+            warn "worktree '$(basename "$path")' has uncommitted changes or is locked; re-run with --force"
+            return 1
+        fi
+    fi
+
+    if [ -n "$branch" ] && [ "$branch" != "(detached)" ]; then
+        if [ "$force" = "1" ]; then
+            git -C "$REPO_ROOT" branch -D "$branch" >/dev/null 2>&1 || true
+        elif ! git -C "$REPO_ROOT" branch -d "$branch" >/dev/null 2>&1; then
+            warn "branch '$branch' is not fully merged and was kept (delete with: git -C $REPO_ROOT branch -D $branch)"
+        fi
+    fi
+
+    success "removed $(basename "$path")"
+    return 0
+}
+
+cmd_delete() {
+    local force=0 all=0 target=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--force) force=1; shift ;;
+            -a|--all|all) all=1; shift ;;
+            -*) die "unknown option for delete: $1" ;;
+            *) [ -z "$target" ] && target="$1" || die "unexpected argument: $1"; shift ;;
+        esac
+    done
+
+    resolve_repo
+    load_worktrees
+
+    local total
+    total="$(worktree_count)"
+    [ "$total" -gt 0 ] || { info "no worktrees to delete"; return 0; }
+
+    if [ "$all" -eq 1 ]; then
+        printf '%s\n' "About to delete $total worktree(s) for '$REPO_NAME':"
+        local i=0
+        while [ "$i" -lt "$total" ]; do
+            printf '  - %s\n' "$(basename "${WT_PATHS[$i]}")"
+            i=$((i + 1))
+        done
+
+        printf 'Continue? [y/N] '
+        local reply
+        read -r reply
+        case "$reply" in
+            y|Y|yes|YES) ;;
+            *) info "aborted"; return 0 ;;
+        esac
+
+        i=0
+        while [ "$i" -lt "$total" ]; do
+            delete_one "${WT_PATHS[$i]}" "${WT_BRANCHES[$i]}" "$force" || true
+            i=$((i + 1))
+        done
+        return 0
+    fi
+
+    [ -n "$target" ] || die "usage: wt delete <name|index> | wt delete --all"
+
+    select_worktree "$target" \
+        || die "no worktree matching '$target' (run 'wt list')"
+
+    delete_one "$SELECTED_PATH" "$SELECTED_BRANCH" "$force"
+}
+
+# Prints a worktree path so it can be used for shell navigation:
+#   cd "$(wt path 2)"
+cmd_path() {
+    local target="${1:-}"
+    [ -n "$target" ] || die "usage: wt path <name|index>"
+
+    resolve_repo
+    load_worktrees
+    select_worktree "$target" || die "no worktree matching '$target'"
+    printf '%s\n' "$SELECTED_PATH"
+}
+
+cmd_config() {
+    case "${1:-show}" in
+        path) printf '%s\n' "$CONFIG_FILE" ;;
+        edit) "${EDITOR:-vi}" "$CONFIG_FILE" ;;
+        show) cat "$CONFIG_FILE" ;;
+        *) die "usage: wt config [show|path|edit]" ;;
+    esac
+}
+
+usage() {
+    cat <<EOF
+wt — git worktree manager
+
+usage:
+  wt create <name> [--from <branch>]   create a worktree off the configured base branch
+  wt list                              list worktrees for the current repository
+  wt delete <name|index> [--force]     delete one worktree (and its branch, if merged)
+  wt delete --all [--force]            delete every worktree for this repository
+  wt path <name|index>                 print a worktree path
+  wt config [show|path|edit]           inspect or edit the config file
+
+examples:
+  wt create fix-bug-2
+  wt list
+  wt delete fix-bug-2
+  wt delete 1
+  wt delete --all
+
+config: $CONFIG_FILE
+  worktree_root = ~/Work/worktrees
+
+  [repos]
+  <repo1> = <branch1>
+  <repo2> = <branch2>
+
+tip: add this to your shell rc to jump into a worktree
+  wtcd() { cd "\$(wt path "\$1")"; }
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    [ $# -gt 0 ] && shift || true
+
+    case "$cmd" in
+        -h|--help|help) usage; return 0 ;;
+    esac
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        write_default_config
+        info "created a starter config at $CONFIG_FILE"
+        info "add your repositories under [repos], then re-run"
+        [ "$cmd" = "config" ] || return 1
+    fi
+
+    case "$cmd" in
+        create)          cmd_create "$@" ;;
+        list|ls)         cmd_list "$@" ;;
+        delete|rm|remove) cmd_delete "$@" ;;
+        path)            cmd_path "$@" ;;
+        config)          cmd_config "$@" ;;
+        *)               printf '%s\n\n' "${C_RED}error:${C_OFF} unknown command '$cmd'" >&2; usage >&2; return 1 ;;
+    esac
+}
+
+main "$@"
