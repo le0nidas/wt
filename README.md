@@ -4,19 +4,12 @@ A small git worktree manager. It figures out which repository you are in and
 uses a config file to decide which branch to base new worktrees on and where to
 put them.
 
-Written for bash 3.2, the version macOS ships.
-
 ## Install
 
-```bash
-ln -sf ~/Work/wt/wt ~/.bin/wt
-```
-
-Optionally add a helper to your shell rc so you can jump into a worktree
-(a script cannot change its parent shell's directory):
+Clone the repo and create a link in a folder that $PATH is reading:
 
 ```bash
-wtcd() { cd "$(wt path "$1")"; }
+ln -sf <repo path>/wt ~/.bin/wt
 ```
 
 ## Config
@@ -62,7 +55,7 @@ with the new worktree as its working directory and gets:
 | `$3` | `WT_BRANCH` | the new branch |
 | `$4` | `WT_REPO_ROOT` | the main checkout |
 
-Example `~/.config/wt/skroutz-android.setup.sh`:
+Example `~/.config/wt/repo1.setup.sh`:
 
 ```bash
 #!/usr/bin/env bash
