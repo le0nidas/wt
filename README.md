@@ -43,6 +43,41 @@ The key under `[repos]` is the directory name of the repository. Running `wt`
 anywhere inside `~/Work/<repo1>` resolves to `<repo1>`, so new worktrees branch
 off `<branch1>`.
 
+## Setup hooks
+
+To run extra setup after a worktree is created, drop an executable script named
+after the repository next to the config file:
+
+```bash
+~/.config/wt/<repo>.setup.sh
+```
+
+If it exists, `wt create` runs it once the worktree is in place. The script runs
+with the new worktree as its working directory and gets:
+
+| arg | env | value |
+| --- | --- | --- |
+| `$1` | `WT_WORKTREE` | the new worktree path |
+| `$2` | `WT_REPO` | repository name |
+| `$3` | `WT_BRANCH` | the new branch |
+| `$4` | `WT_REPO_ROOT` | the main checkout |
+
+Example `~/.config/wt/skroutz-android.setup.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+worktree="$1"
+repo_root="$4"
+
+cp "$repo_root/local.properties" "$worktree/local.properties"
+cp "$repo_root/.env" "$worktree/.env"
+```
+
+Make it executable (`chmod +x`); otherwise `wt` warns and runs it with `bash`.
+A failing script is reported as a warning — the worktree is kept.
+
 ## Usage
 
 ```

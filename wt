@@ -137,6 +137,67 @@ config_base_branch() {
 }
 
 # ---------------------------------------------------------------------------
+# Setup hooks
+# ---------------------------------------------------------------------------
+#
+# After a worktree is created, wt looks for
+#
+#   <config dir>/<repo>.setup.sh
+#
+# and runs it when it exists. The script is executed with the new worktree as
+# its working directory and receives:
+#
+#   $1  worktree path
+#   $2  repository name
+#   $3  new branch name
+#   $4  main repository root
+#
+# The same values are exported as WT_WORKTREE / WT_REPO / WT_BRANCH /
+# WT_REPO_ROOT so scripts can use whichever style they prefer.
+
+setup_script_path() {
+    printf '%s/%s.setup.sh' "$(dirname "$CONFIG_FILE")" "$1"
+}
+
+run_setup_script() {
+    local repo="$1" worktree="$2" branch="$3" script status=0
+
+    script="$(setup_script_path "$repo")"
+    [ -f "$script" ] || return 0
+
+    info "running setup script $script"
+
+    if [ -x "$script" ]; then
+        (
+            cd "$worktree" \
+            && WT_WORKTREE="$worktree" \
+               WT_REPO="$repo" \
+               WT_BRANCH="$branch" \
+               WT_REPO_ROOT="$REPO_ROOT" \
+               "$script" "$worktree" "$repo" "$branch" "$REPO_ROOT"
+        ) || status=$?
+    else
+        warn "$script is not executable, running it with bash (chmod +x to silence this)"
+        (
+            cd "$worktree" \
+            && WT_WORKTREE="$worktree" \
+               WT_REPO="$repo" \
+               WT_BRANCH="$branch" \
+               WT_REPO_ROOT="$REPO_ROOT" \
+               bash "$script" "$worktree" "$repo" "$branch" "$REPO_ROOT"
+        ) || status=$?
+    fi
+
+    if [ "$status" -ne 0 ]; then
+        warn "setup script exited with status $status; the worktree was still created"
+        return 1
+    fi
+
+    success "setup script finished"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Repository discovery
 # ---------------------------------------------------------------------------
 
@@ -289,6 +350,8 @@ cmd_create() {
 
     info "creating worktree '$name' from '$base'"
     git -C "$REPO_ROOT" worktree add -b "$name" "$path" "$start_point"
+
+    run_setup_script "$REPO_NAME" "$path" "$name" || true
 
     success "$path"
     printf '%s\n' "${C_DIM}cd $path${C_OFF}"
@@ -451,6 +514,10 @@ config: $CONFIG_FILE
   [repos]
   <repo1> = <branch1>
   <repo2> = <branch2>
+
+setup hooks: $(dirname "$CONFIG_FILE")/<repo>.setup.sh
+  runs after a worktree is created, from inside it, with
+  \$1=worktree path \$2=repo \$3=branch \$4=repo root
 
 tip: add this to your shell rc to jump into a worktree
   wtcd() { cd "\$(wt path "\$1")"; }
